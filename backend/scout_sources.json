@@ -1,0 +1,5 @@
+[
+  {"provider": "Spotify", "url": "https://www.spotify.com/us/premium/"},
+  {"provider": "Netflix", "url": "https://help.netflix.com/en/node/24926"},
+  {"provider": "Dropbox", "url": "https://www.dropbox.com/plans"}
+]
