@@ -5,17 +5,19 @@ import asyncio
 import hashlib
 import json
 import os
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from urllib.parse import urlparse
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from .database import SessionLocal, get_db
-from .models import AuditEvent, ScoutDeal, Subscription
+from .models import AuditEvent, ScoutDeal, SimulatedSwitch, Subscription
 
 router = APIRouter(prefix='/agent', tags=['AI Deal Scout'])
 scan_lock = asyncio.Lock()
@@ -146,10 +148,32 @@ def classify(sub, candidate, review):
 class SwipePayload(BaseModel):
     decision: str
 
+OPEN = ('candidate', 'conditional')
+
+
+def live_savings(deal, sub):
+    """Yearly saving of a deal against what the subscription costs right now (it may have been switched or edited)."""
+    target_annual = deal.upfront_cents if deal.billing_period == 'yearly' else deal.target_monthly_cents * 12
+    return sub.monthly_cost_cents * 12 - target_annual
+
+
 @router.get('/pile')
 def pile(db: Session = Depends(get_db)):
-    deals = db.scalars(select(ScoutDeal).where(ScoutDeal.status.in_(['candidate', 'conditional'])).order_by(ScoutDeal.annual_savings_cents.desc())).all()
-    return {'deals': [d.as_dict() for d in deals], 'realized_savings_cents': 0}
+    # Cards are priced against the subscription as it is now, so a simulated switch re-prices the rest of
+    # the pile and hides offers that no longer save money, without deleting anything.
+    out = []
+    for deal in db.scalars(select(ScoutDeal).where(ScoutDeal.status.in_(OPEN))).all():
+        sub = db.get(Subscription, deal.subscription_id)
+        if sub is None:
+            continue
+        savings = live_savings(deal, sub)
+        if savings <= 0:
+            continue
+        item = deal.as_dict()
+        item.update(current_provider=sub.provider, current_plan=sub.plan_name, current_monthly_cents=sub.monthly_cost_cents, annual_savings_cents=savings)
+        out.append(item)
+    out.sort(key=lambda d: d['annual_savings_cents'], reverse=True)
+    return {'deals': out, 'realized_savings_cents': 0}
 
 @router.get('/history')
 def history(db: Session = Depends(get_db)):
@@ -160,48 +184,152 @@ def swipe(deal_id: int, payload: SwipePayload, db: Session = Depends(get_db)):
     if payload.decision not in ('approve', 'pass'):
         raise HTTPException(422, 'decision must be approve or pass')
     deal = db.get(ScoutDeal, deal_id)
-    if not deal or deal.status not in ('candidate', 'conditional'):
+    if not deal or deal.status not in OPEN:
         raise HTTPException(404, 'Deal is not in the swipe pile')
+    if payload.decision == 'approve':
+        sub = db.get(Subscription, deal.subscription_id)
+        if sub is not None:
+            # Simulated switch: the plan on the Plans page becomes the approved offer. What it replaced is
+            # remembered so the switch can be undone. No provider account is touched.
+            sub.switches.append(SimulatedSwitch(deal_id=deal.id, deal_status=deal.status, previous_provider=sub.provider,
+                                                previous_plan_name=sub.plan_name, previous_monthly_cost_cents=sub.monthly_cost_cents))
+            deal.current_plan, deal.current_monthly_cents, deal.annual_savings_cents = sub.plan_name, sub.monthly_cost_cents, live_savings(deal, sub)
+            sub.provider, sub.plan_name, sub.monthly_cost_cents = deal.provider or sub.provider, deal.plan_name or sub.plan_name, deal.target_monthly_cents
     deal.status = 'mock_approved' if payload.decision == 'approve' else 'passed'
     db.add(AuditEvent(event_type='scout.mock_' + payload.decision, entity_id=deal.id, details='Simulation only; no provider action'))
     db.commit()
     return {'decision': payload.decision, 'mode': 'simulation_only', 'realized_savings_cents': 0,
-            'message': 'Mock approval saved. No purchase, cancellation or subscription change occurred.' if payload.decision == 'approve' else 'Deal passed.'}
+            'message': 'Plan switched in the simulation. No real purchase, cancellation or account change occurred.' if payload.decision == 'approve' else 'Deal passed.'}
 
-@router.post('/scan')
-async def scan():
+
+# One scan at a time, in a background thread. The page polls /agent/scan/status,
+# so a refresh or a dropped connection no longer loses the scan.
+_state_lock = threading.Lock()
+_scan_state = {'running': False, 'phase': 'idle', 'done': 0, 'total': 0, 'started_at': None, 'finished_at': None, 'result': None}
+
+
+def _set_state(**changes):
+    with _state_lock:
+        _scan_state.update(changes)
+
+
+def _bump():
+    with _state_lock:
+        _scan_state['done'] += 1
+
+
+def _snapshot():
+    with _state_lock:
+        return dict(_scan_state)
+
+
+def _now():
+    return datetime.now(timezone.utc).isoformat()
+
+
+@router.get('/scan/status')
+def scan_status():
+    return _snapshot()
+
+
+@router.post('/scan', status_code=202)
+def scan():
     if not os.getenv('OPENAI_API_KEY'):
         raise HTTPException(503, 'Set OPENAI_API_KEY in backend/.env to enable AI scouting')
-    if scan_lock.locked():
-        raise HTTPException(409, 'A scan is already running')
-    async with scan_lock:
-        # The OpenAI SDK is synchronous; run it in a thread to avoid blocking FastAPI.
-        return await asyncio.to_thread(run_scan)
+    with _state_lock:
+        if _scan_state['running']:
+            raise HTTPException(409, 'A scan is already running')
+        _scan_state.update(running=True, phase='research', done=0, total=0, started_at=_now(), finished_at=None, result=None)
+    threading.Thread(target=_scan_job, daemon=True).start()
+    return _snapshot()
+
+
+def _scan_job():
+    try:
+        result = run_scan()
+    except Exception as exc:
+        result = {'new_deals': 0, 'rejected': 0, 'skipped': 0, 'errors': [f'{type(exc).__name__}: {str(exc)[:160]}'], 'message': 'Scan failed.'}
+    _set_state(running=False, phase='idle', finished_at=_now(), result=result)
+
+
+def offer_fingerprint(sub_id, candidate):
+    # Provider, price and billing period identify an offer. The plan name is left out on purpose:
+    # the AI words it differently from scan to scan.
+    return hashlib.sha256(json.dumps([sub_id, str(candidate.get('provider', '')).strip().casefold(), cents(candidate.get('price')), candidate.get('billing_period')]).encode()).hexdigest()
+
+
+def already_seen(db, sub, candidate, assessment):
+    """True if this subscription already has a deal (open, approved or passed) from the same provider at the same price."""
+    provider = str(candidate.get('provider', ''))[:120].strip().lower()
+    return db.scalar(select(ScoutDeal.id).where(
+        ScoutDeal.subscription_id == sub.id,
+        func.lower(func.trim(ScoutDeal.provider)) == provider,
+        ScoutDeal.billing_period == assessment['billing_period'],
+        ScoutDeal.target_monthly_cents == assessment['target_monthly_cents'],
+    ).limit(1)) is not None
+
 
 def run_scan():
+    """Research and review run in parallel; identical subscriptions share one round of AI calls."""
     from openai import OpenAI
     client = OpenAI(api_key=os.environ['OPENAI_API_KEY'], timeout=90, max_retries=1)
+    workers = max(1, int(os.getenv('SCOUT_MAX_PARALLEL', '6')))
+    today = datetime.now(timezone.utc).date().isoformat()
     errors = []
     found = 0
     rejected = 0
+    skipped = 0
     with SessionLocal() as db:
         subs = db.scalars(select(Subscription).where(Subscription.status == 'active')).all()
+        # Two entries for the same provider, plan and price would ask the AI the same questions twice.
+        groups = {}
         for sub in subs:
+            key = (sub.provider.strip().casefold(), sub.plan_name.strip().casefold(), sub.monthly_cost_cents)
+            groups.setdefault(key, []).append(sub)
+        groups = list(groups.values())
+
+        def research(provider, plan, monthly_cents):
             try:
-                result = ai_call(client, RESEARCH, json.dumps({'service': sub.provider, 'plan': sub.plan_name, 'current_monthly_usd': sub.monthly_cost_cents / 100, 'country': 'United States', 'date': datetime.now(timezone.utc).date().isoformat()}))
-                for candidate in result.get('candidates', [])[:5]:
+                result = ai_call(client, RESEARCH, json.dumps({'service': provider, 'plan': plan, 'current_monthly_usd': monthly_cents / 100, 'country': 'United States', 'date': today}))
+                return result.get('candidates', [])[:5]
+            finally:
+                _bump()
+
+        def verify(provider, plan, candidate):
+            try:
+                return ai_call(client, VERIFY, json.dumps({'subscription': {'provider': provider, 'plan': plan}, 'candidate': candidate, 'date': today}))
+            finally:
+                _bump()
+
+        # Only plain values cross into worker threads; all database work stays on this thread.
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            _set_state(phase='research', done=0, total=len(groups))
+            research_jobs = [(g, pool.submit(research, g[0].provider, g[0].plan_name, g[0].monthly_cost_cents)) for g in groups]
+            candidates = []
+            for group, future in research_jobs:
+                try:
+                    candidates.extend((group, candidate) for candidate in future.result())
+                except Exception as exc:
+                    errors.append(f'{group[0].provider}: {type(exc).__name__}: {str(exc)[:120]}')
+            _set_state(phase='review', done=0, total=len(candidates))
+            verify_jobs = [(group, candidate, pool.submit(verify, group[0].provider, group[0].plan_name, candidate)) for group, candidate in candidates]
+            for group, candidate, future in verify_jobs:
+                try:
+                    review = future.result()
+                except Exception as exc:
+                    errors.append(f'{group[0].provider} candidate: {type(exc).__name__}: {str(exc)[:120]}')
+                    continue
+                for sub in group:
                     try:
-                        review = ai_call(client, VERIFY, json.dumps({'subscription': {'provider': sub.provider, 'plan': sub.plan_name}, 'candidate': candidate, 'date': datetime.now(timezone.utc).date().isoformat()}))
                         assessment, reasons = classify(sub, candidate, review)
                         if assessment is None or assessment['status'] == 'rejected':
                             rejected += 1
                             continue
-                        fingerprint = hashlib.sha256(json.dumps([sub.id, candidate.get('provider'), candidate.get('plan'), candidate.get('price'), candidate.get('billing_period')], sort_keys=True).encode()).hexdigest()
-                        existing = db.scalar(select(ScoutDeal).where(ScoutDeal.fingerprint == fingerprint))
-                        if existing:
-                            # Never re-add passed or approved deals on subsequent scans.
+                        if already_seen(db, sub, candidate, assessment):
+                            # Never re-add passed or approved deals on subsequent scans, whatever the AI calls the plan this time.
+                            skipped += 1
                             continue
-                        deal = ScoutDeal(subscription_id=sub.id, fingerprint=fingerprint,
+                        deal = ScoutDeal(subscription_id=sub.id, fingerprint=offer_fingerprint(sub.id, candidate),
                             provider=str(candidate.get('provider', ''))[:120], plan_name=str(candidate.get('plan', ''))[:120],
                             current_plan=sub.plan_name, current_monthly_cents=sub.monthly_cost_cents,
                             target_monthly_cents=assessment['target_monthly_cents'],
@@ -215,7 +343,6 @@ def run_scan():
                         db.commit()
                         found += 1
                     except Exception as exc:
+                        db.rollback()
                         errors.append(f'{sub.provider} candidate: {type(exc).__name__}: {str(exc)[:120]}')
-            except Exception as exc:
-                errors.append(f'{sub.provider}: {type(exc).__name__}: {str(exc)[:120]}')
-    return {'new_deals': found, 'rejected': rejected, 'errors': errors, 'message': 'Scan finished. Open Swipe Pile to review mock deals.'}
+    return {'new_deals': found, 'rejected': rejected, 'skipped': skipped, 'errors': errors, 'message': 'Scan finished. Open Swipe Pile to review mock deals.'}

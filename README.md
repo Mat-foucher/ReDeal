@@ -34,15 +34,9 @@ Edit `backend/.env`, set `OPENAI_API_KEY=...`. PayPal fields are optional for AI
 python -m uvicorn app.main:app --reload --port 8000
 ```
 
-In another terminal:
+The backend also serves the UI (`frontend/`, plain HTML/CSS/JS with no build step or Node.js).
 
-```bash
-cd frontend
-npm install
-npm run dev
-```
-
-Open http://localhost:3000. Add a subscription with its actual monthly price, select **Swipe Pile**, click **Scan for deals with AI**, and approve/pass the mock cards. Swagger API docs: http://localhost:8000/docs.
+Open http://localhost:8000. To try it on a phone on the same Wi-Fi, add `--host 0.0.0.0` and open `http://<your-computer-ip>:8000` (the API has no authentication, so only do this on a network you trust). Add a subscription with its actual monthly price, select **Swipe Pile**, click **Scan for deals with AI**, and approve/pass the mock cards. Swagger API docs: http://localhost:8000/docs.
 
 ## Behavior and limitations
 

@@ -2,12 +2,12 @@ from dotenv import load_dotenv
 from pathlib import Path
 load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 from datetime import datetime, timezone
-from fastapi import Depends, FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, HTTPException, Query, Response
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 from .database import Base, engine, get_db
-from .models import AuditEvent, Offer, Subscription, SwitchRequest
+from .models import AuditEvent, Offer, ScoutDeal, Subscription, SwitchRequest
 from .schemas import Evaluation, OfferCreate, OfferRead, SubscriptionCreate, SubscriptionRead, SwitchRead
 
 Base.metadata.create_all(bind=engine)  # MVP only; replace with Alembic migrations before production
@@ -31,6 +31,60 @@ def create_subscription(payload: SubscriptionCreate, db: Session = Depends(get_d
 @app.get('/subscriptions', response_model=list[SubscriptionRead])
 def list_subscriptions(db: Session = Depends(get_db)):
     return db.scalars(select(Subscription).order_by(Subscription.id.desc())).all()
+
+@app.put('/subscriptions/{subscription_id}', response_model=SubscriptionRead)
+def update_subscription(subscription_id: int, payload: SubscriptionCreate, db: Session = Depends(get_db)):
+    sub = db.get(Subscription, subscription_id)
+    if sub is None:
+        raise HTTPException(404, 'Subscription not found')
+    for key, value in payload.model_dump().items():
+        setattr(sub, key, value)
+    # Cards still in the pile quote the old plan and price: refresh them, and drop any that no longer save money.
+    open_deals = db.scalars(select(ScoutDeal).where(ScoutDeal.subscription_id == sub.id, ScoutDeal.status.in_(['candidate', 'conditional']))).all()
+    for deal in open_deals:
+        target_annual = deal.upfront_cents if deal.billing_period == 'yearly' else deal.target_monthly_cents * 12
+        savings = sub.monthly_cost_cents * 12 - target_annual
+        if savings <= 0:
+            db.delete(deal)
+        else:
+            deal.current_plan, deal.current_monthly_cents, deal.annual_savings_cents = sub.plan_name, sub.monthly_cost_cents, savings
+    db.add(AuditEvent(event_type='subscription.updated', entity_id=sub.id, details=sub.provider))
+    db.commit()
+    db.refresh(sub)
+    return sub
+
+@app.post('/subscriptions/{subscription_id}/undo-switch', response_model=SubscriptionRead)
+def undo_switch(subscription_id: int, db: Session = Depends(get_db)):
+    """Undo the most recent simulated switch: the plan goes back to what it replaced and the deal returns to the pile."""
+    sub = db.get(Subscription, subscription_id)
+    if sub is None:
+        raise HTTPException(404, 'Subscription not found')
+    if not sub.switches:
+        raise HTTPException(409, 'This subscription has no simulated switch to undo')
+    last = sub.switches[-1]
+    sub.provider, sub.plan_name, sub.monthly_cost_cents = last.previous_provider, last.previous_plan_name, last.previous_monthly_cost_cents
+    deal = db.get(ScoutDeal, last.deal_id) if last.deal_id else None
+    if deal is not None and deal.subscription_id == sub.id and deal.status == 'mock_approved':
+        deal.status = last.deal_status
+    sub.switches.remove(last)
+    db.add(AuditEvent(event_type='subscription.switch_undone', entity_id=sub.id, details='Simulation only; no provider action'))
+    db.commit()
+    db.refresh(sub)
+    return sub
+
+@app.delete('/subscriptions/{subscription_id}', status_code=204)
+def delete_subscription(subscription_id: int, db: Session = Depends(get_db)):
+    sub = db.get(Subscription, subscription_id)
+    if sub is None:
+        raise HTTPException(404, 'Subscription not found')
+    # Remove everything that hangs off the subscription; the audit trail is kept.
+    db.execute(delete(ScoutDeal).where(ScoutDeal.subscription_id == subscription_id))
+    db.execute(delete(SwitchRequest).where(SwitchRequest.subscription_id == subscription_id))
+    db.execute(delete(Offer).where(Offer.subscription_id == subscription_id))
+    db.add(AuditEvent(event_type='subscription.deleted', entity_id=subscription_id, details=sub.provider))
+    db.delete(sub)
+    db.commit()
+    return Response(status_code=204)
 
 @app.post('/subscriptions/{subscription_id}/offers', response_model=OfferRead, status_code=201)
 def create_offer(subscription_id: int, payload: OfferCreate, db: Session = Depends(get_db)):
@@ -110,3 +164,9 @@ app.include_router(scout_router)
 
 from .agent_scout import router as agent_router
 app.include_router(agent_router)
+
+# Serve the static frontend from the same origin (mounted last so API routes win).
+from fastapi.staticfiles import StaticFiles
+_frontend = Path(__file__).resolve().parents[2] / 'frontend'
+if _frontend.is_dir():
+    app.mount('/', StaticFiles(directory=_frontend, html=True), name='frontend')

@@ -8,10 +8,17 @@ class SubscriptionCreate(BaseModel):
     monthly_cost_cents: int = Field(ge=0)
     cancellation_fee_cents: int = Field(default=0, ge=0)
 
+class SimulatedSwitchInfo(BaseModel):
+    original_provider: str
+    original_plan_name: str
+    original_monthly_cost_cents: int
+    steps: int
+
 class SubscriptionRead(SubscriptionCreate):
     model_config = ConfigDict(from_attributes=True)
     id: int
     status: str
+    switch: SimulatedSwitchInfo | None = None
 
 class OfferCreate(BaseModel):
     provider: str = Field(min_length=1, max_length=120)
