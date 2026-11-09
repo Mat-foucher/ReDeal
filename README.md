@@ -38,6 +38,16 @@ The backend also serves the UI (`frontend/`, plain HTML/CSS/JS with no build ste
 
 Open http://localhost:8000. To try it on a phone on the same Wi-Fi, add `--host 0.0.0.0` and open `http://<your-computer-ip>:8000` (the API has no authentication, so only do this on a network you trust). Add a subscription with its actual monthly price, select **Swipe Pile**, click **Scan for deals with AI**, and approve/pass the mock cards. Swagger API docs: http://localhost:8000/docs.
 
+## Deploy to Render
+
+The repository includes a `render.yaml` Blueprint: one web service that serves both the API and the UI, plus a Postgres database.
+
+1. In Render choose **New > Blueprint** and select this repository.
+2. Fill in the secrets it asks for. `OPENAI_API_KEY` enables the AI scan; the `PAYPAL_*` values are only needed for the sandbox demo in Labs and can be left blank.
+3. After the deploy, open the service's **Environment** tab and copy `APP_PASSWORD` (Render generates it). The site asks for it on first visit; the username is `redeal`.
+
+Notes: the hosted site uses Postgres through `DATABASE_URL`, so it starts empty and does not use `backend/redealer.db`. Free web services sleep when idle and wake on the next visit, and a scan that is running when the service restarts is lost. Free Postgres databases are time-limited; check Render's current terms. Anyone with the password can run scans that spend your OpenAI credit.
+
 ## Behavior and limitations
 
 - **Scan is manual by default** to prevent surprise web-search API charges. A scan processes all active subscriptions, with up to five candidates and a separate verification call per candidate. The request may take minutes; keep the backend running.

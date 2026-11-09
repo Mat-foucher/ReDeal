@@ -1,0 +1,44 @@
+# Render Blueprint: one web service (API + UI) and a Postgres database.
+# In Render: New > Blueprint, pick this repository, then fill in the secrets it asks for.
+databases:
+  - name: redeal-db
+    plan: free
+
+services:
+  - type: web
+    name: redeal
+    runtime: python
+    plan: free
+    rootDir: backend
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.7
+      - key: DATABASE_URL
+        fromDatabase:
+          name: redeal-db
+          property: connectionString
+      # Sign-in for the hosted site. Render generates the password; read it in the service's Environment tab.
+      - key: APP_USERNAME
+        value: redeal
+      - key: APP_PASSWORD
+        generateValue: true
+      # Secrets you type into Render (never commit them).
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: PAYPAL_ENVIRONMENT
+        value: sandbox
+      - key: PAYPAL_CLIENT_ID
+        sync: false
+      - key: PAYPAL_CLIENT_SECRET
+        sync: false
+      - key: PAYPAL_STANDARD_PLAN_ID
+        sync: false
+      - key: PAYPAL_SAVER_PLAN_ID
+        sync: false
+      - key: PAYPAL_DEMO_SUBSCRIPTION_ID
+        sync: false
+      - key: PAYPAL_DEMO_ACTION_KEY
+        sync: false

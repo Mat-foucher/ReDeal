@@ -1,3 +1,6 @@
+import base64
+import os
+import secrets
 from dotenv import load_dotenv
 from pathlib import Path
 load_dotenv(Path(__file__).resolve().parents[1] / ".env")
@@ -13,6 +16,27 @@ from .schemas import Evaluation, OfferCreate, OfferRead, SubscriptionCreate, Sub
 Base.metadata.create_all(bind=engine)  # MVP only; replace with Alembic migrations before production
 app = FastAPI(title='ReDealer API', version='0.1.0')
 app.add_middleware(CORSMiddleware, allow_origins=['http://localhost:3000', 'http://127.0.0.1:3000'], allow_methods=['*'], allow_headers=['*'])
+
+# Optional password gate for public hosting. Set APP_PASSWORD (and optionally APP_USERNAME) and every
+# page and API route except /health asks for it with the browser's own sign-in prompt. Unset = open, as on localhost.
+_app_password = os.getenv('APP_PASSWORD', '')
+if _app_password:
+    _expected = (os.getenv('APP_USERNAME', 'redeal') + ':' + _app_password).encode()
+
+    @app.middleware('http')
+    async def require_password(request, call_next):
+        if request.url.path == '/health':
+            return await call_next(request)
+        header = request.headers.get('authorization', '')
+        supplied = b''
+        if header[:6].lower() == 'basic ':
+            try:
+                supplied = base64.b64decode(header[6:], validate=True)
+            except ValueError:
+                supplied = b''
+        if not secrets.compare_digest(supplied, _expected):
+            return Response('Password required', status_code=401, headers={'WWW-Authenticate': 'Basic realm="ReDeal", charset="UTF-8"'})
+        return await call_next(request)
 
 @app.get('/health')
 def health():

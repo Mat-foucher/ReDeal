@@ -7,3 +7,5 @@ httpx>=0.27,<1
 python-dotenv>=1.0,<2
 # Scout uses httpx (already included); no extra dependencies
 openai>=1.100,<3
+# Postgres driver, used when DATABASE_URL points at Postgres (e.g. on Render)
+psycopg[binary]>=3.1,<4
