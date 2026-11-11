@@ -1,20 +1,27 @@
-# PayPal sandbox integration (v0.2)
+# PayPal sandbox setup
 
-This increment adds real PayPal sandbox product/plan creation and a buyer approval flow. It does **not** yet implement switching, buyer ownership, webhooks or verified savings. Do not expose the API publicly without authentication, authorization, rate limits, and abuse controls.
+The full walkthrough is in [README.md](README.md#run-it-locally). In short:
 
-1. From `backend/`, activate `.venv` and run `pip install -r requirements.txt`.
-2. Put your sandbox client ID and secret in `backend/.env` (see `.env.example`). Never commit this file.
-3. Run `python setup_paypal_plans.py` **once**. This creates one fictional product and two plans ($25 and $15 per month). Re-running creates duplicates.
-4. Copy `PAYPAL_STANDARD_PLAN_ID` and `PAYPAL_SAVER_PLAN_ID` output lines into `backend/.env`.
-5. Start backend: `uvicorn app.main:app --reload --port 8000`.
-6. Visit `http://127.0.0.1:8000/docs`, use `GET /paypal/demo-plans` to verify IDs.
-7. Use `POST /paypal/subscriptions/create` with `{"plan":"standard"}`; open the returned `approval_url` in your browser and log in with a **sandbox personal buyer** account (not your real PayPal account).
-8. Use `GET /paypal/subscriptions/{subscription_id}` to check state. Buyer approval and activation can be asynchronous.
+1. Put your sandbox **Client ID** and **Secret** in `backend/.env` (from https://developer.paypal.com/dashboard/applications/sandbox).
+2. From `backend/`, run `python setup_paypal_plans.py` **once**. It creates a fictional product with a Standard ($25/mo) and a Saver ($15/mo) plan. Copy the printed plan IDs into `.env`.
+3. Start the server, open **Labs** → **Start a sandbox subscription** → **Standard**, and approve it with your **sandbox personal account** (from https://developer.paypal.com/dashboard/accounts). Put the `I-…` subscription ID in `PAYPAL_DEMO_SUBSCRIPTION_ID` and restart.
+4. **Plans** → **Add a Plan Billed via PayPal**, then scan in the **Swipe Pile**.
 
-## Next milestone
+## PayPal APIs used
 
-Add authenticated per-user PayPal subscription ownership, buyer-consented plan revision, return URL handling, verified PayPal webhooks, and billing reconciliation. Only then connect a right swipe to a switch request. Do not increment actual savings based on an unverified approval or simulated subscription.
+| API | Used for |
+|---|---|
+| `POST /v1/oauth2/token` | Server-side client-credentials token |
+| `POST /v1/catalogs/products`, `POST /v1/billing/plans` | Creating the demo merchant catalog (`setup_paypal_plans.py`) |
+| `GET /v1/catalogs/products/{id}` | Merchant name shown on the plan |
+| `GET /v1/billing/plans?product_id=…`, `GET /v1/billing/plans/{id}` | The agent reads every active plan and its price |
+| `POST /v1/billing/subscriptions` | Starting a sandbox subscription |
+| `GET /v1/billing/subscriptions/{id}` | Live status, current plan, and next billing date |
+| `POST /v1/billing/subscriptions/{id}/revise` | Switching plans when you approve a deal, and switching back on undo; the buyer confirms on PayPal |
 
-## Render note
+## Safety
 
-Keep the existing Next.js UI while building the payment integration. Consider Python-first Streamlit migration only after testing swipe interaction quality. On Render use environment variables for secrets and a managed database for persistence; never rely on ephemeral SQLite storage. Free services can spin down, making always-on scouting unreliable.
+- `PAYPAL_ENVIRONMENT` must be `sandbox`; the app refuses anything else.
+- Credentials stay on the server, and PayPal error payloads are never forwarded to the browser.
+- Every switch needs your approval in ReDeal **and** the buyer's confirmation on PayPal.
+- Realized savings stay at $0 until a lower charge is verified. Webhook-based verification is the next step for production.

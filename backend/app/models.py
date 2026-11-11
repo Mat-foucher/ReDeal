@@ -15,6 +15,8 @@ class Subscription(Base):
     monthly_cost_cents: Mapped[int] = mapped_column(Integer)
     cancellation_fee_cents: Mapped[int] = mapped_column(Integer, default=0)
     status: Mapped[str] = mapped_column(String(30), default='active')
+    # Set when this plan is billed through PayPal (a sandbox subscription ID like I-XXXX). ReDeal can then switch it for real.
+    paypal_subscription_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     offers: Mapped[list['Offer']] = relationship(back_populates='subscription')
     # Simulated plan switches made by approving deals, oldest first. Undoing pops the newest.
@@ -80,6 +82,8 @@ class ScoutDeal(Base):
     status: Mapped[str] = mapped_column(String(30), default='candidate')
     caveat: Mapped[str] = mapped_column(Text, default='')
     review_reason: Mapped[str] = mapped_column(Text, default='')
+    # PayPal plan this deal switches to. Set only for deals found in a PayPal merchant's catalog.
+    paypal_plan_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
     def as_dict(self):
@@ -87,7 +91,7 @@ class ScoutDeal(Base):
             'id', 'subscription_id', 'provider', 'plan_name', 'current_plan',
             'current_monthly_cents', 'target_monthly_cents', 'annual_savings_cents',
             'billing_period', 'upfront_cents', 'eligibility', 'tradeoffs',
-            'source_url', 'status', 'caveat', 'review_reason')}
+            'source_url', 'status', 'caveat', 'review_reason', 'paypal_plan_id')}
 
 
 class SimulatedSwitch(Base):
@@ -100,4 +104,6 @@ class SimulatedSwitch(Base):
     previous_provider: Mapped[str] = mapped_column(String(120))
     previous_plan_name: Mapped[str] = mapped_column(String(120))
     previous_monthly_cost_cents: Mapped[int] = mapped_column(Integer)
+    # For PayPal-billed plans: the PayPal plan before the switch, so undo can switch back at PayPal.
+    previous_paypal_plan_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)

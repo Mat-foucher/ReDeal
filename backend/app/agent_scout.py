@@ -1,5 +1,11 @@
-"""AI research -> independent AI review -> deterministic savings -> persistent mock swipe pile.
-No payment, cancellation or merchant-account operations are performed here.
+"""The ReDeal agent: AI research -> independent AI review -> deterministic savings -> Swipe Pile.
+
+Two kinds of plans:
+- Plans billed through PayPal: the agent reads the merchant's real plan catalog from PayPal, the AI compares
+  the cheaper plans, and approving a card asks PayPal to revise the subscription (sandbox). The buyer
+  confirms on PayPal's own page, so nothing changes without the user's explicit consent.
+- Any other plan: the AI researches offers on the web. Approving records the switch in ReDeal only, because
+  ReDeal has no access to that provider's account.
 """
 import asyncio
 import hashlib
@@ -11,7 +17,7 @@ from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from urllib.parse import urlparse
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
@@ -68,6 +74,32 @@ VERIFY_SCHEMA = {
     'required': ['price_supported', 'billing_period_supported', 'currently_available', 'comparable', 'source_url', 'eligibility', 'tradeoffs', 'reason'],
     'additionalProperties': False,
 }
+
+
+COMPARE = '''You help a subscriber decide whether to move to a cheaper plan from the SAME merchant. You get the subscriber's current plan and one cheaper plan, both read from the merchant's PayPal billing catalog (names, descriptions, prices, billing frequency). Use only that data; never invent features. Return ONLY JSON {"comparable":true/false,"eligibility":"...","tradeoffs":"...","reason":"..."}. comparable is false only if the data shows the cheaper plan is clearly a different kind of service. eligibility: who can switch (one short sentence). tradeoffs: what the subscriber may give up, or say the catalog lists no differences besides price. reason: one or two sentences a subscriber can read on a card. Do not calculate savings.'''
+
+COMPARE_SCHEMA = {
+    'type': 'object',
+    'properties': {'comparable': {'type': 'boolean'}, 'eligibility': _string(), 'tradeoffs': _string(), 'reason': _string()},
+    'required': ['comparable', 'eligibility', 'tradeoffs', 'reason'],
+    'additionalProperties': False,
+}
+
+
+def ai_compare(client, current_plan, candidate_plan):
+    """AI review of a cheaper plan from the merchant's PayPal catalog (no web search: the catalog is the source of truth)."""
+    def describe(plan):
+        return {'name': plan.get('name'), 'description': plan.get('description'), 'billing_cycles': plan.get('billing_cycles')}
+    response = client.responses.create(
+        model=os.getenv('OPENAI_SCOUT_MODEL', 'gpt-5.1'),
+        instructions=COMPARE,
+        input=json.dumps({'current_plan': describe(current_plan), 'cheaper_plan': describe(candidate_plan)}),
+        text={'format': {'type': 'json_schema', 'name': 'plan_comparison', 'strict': True, 'schema': COMPARE_SCHEMA}},
+        max_output_tokens=1500,
+    )
+    if response.status != 'completed':
+        raise RuntimeError(f'AI comparison not completed (status={response.status})')
+    return parse_json(response.output_text)
 
 
 def parse_json(raw):
@@ -180,26 +212,48 @@ def history(db: Session = Depends(get_db)):
     return {'deals': [d.as_dict() for d in db.scalars(select(ScoutDeal).order_by(ScoutDeal.id.desc())).all()]}
 
 @router.post('/pile/{deal_id}/swipe')
-def swipe(deal_id: int, payload: SwipePayload, db: Session = Depends(get_db)):
+def swipe(deal_id: int, payload: SwipePayload, request: Request, db: Session = Depends(get_db)):
     if payload.decision not in ('approve', 'pass'):
         raise HTTPException(422, 'decision must be approve or pass')
     deal = db.get(ScoutDeal, deal_id)
     if not deal or deal.status not in OPEN:
         raise HTTPException(404, 'Deal is not in the swipe pile')
-    if payload.decision == 'approve':
-        sub = db.get(Subscription, deal.subscription_id)
-        if sub is not None:
-            # Simulated switch: the plan on the Plans page becomes the approved offer. What it replaced is
-            # remembered so the switch can be undone. No provider account is touched.
-            sub.switches.append(SimulatedSwitch(deal_id=deal.id, deal_status=deal.status, previous_provider=sub.provider,
-                                                previous_plan_name=sub.plan_name, previous_monthly_cost_cents=sub.monthly_cost_cents))
-            deal.current_plan, deal.current_monthly_cents, deal.annual_savings_cents = sub.plan_name, sub.monthly_cost_cents, live_savings(deal, sub)
-            sub.provider, sub.plan_name, sub.monthly_cost_cents = deal.provider or sub.provider, deal.plan_name or sub.plan_name, deal.target_monthly_cents
-    deal.status = 'mock_approved' if payload.decision == 'approve' else 'passed'
-    db.add(AuditEvent(event_type='scout.mock_' + payload.decision, entity_id=deal.id, details='Simulation only; no provider action'))
+    if payload.decision == 'pass':
+        deal.status = 'passed'
+        db.add(AuditEvent(event_type='scout.pass', entity_id=deal.id, details='Passed'))
+        db.commit()
+        return {'decision': 'pass', 'mode': 'passed', 'realized_savings_cents': 0, 'message': 'Deal passed.'}
+
+    sub = db.get(Subscription, deal.subscription_id)
+    if sub is None:
+        raise HTTPException(404, 'Subscription not found')
+    approval_url, previous_plan_id = None, None
+    via_paypal = bool(deal.paypal_plan_id and sub.paypal_subscription_id)
+    if via_paypal:
+        # The approval is the user's explicit consent. Check PayPal's live state, then ask PayPal to switch the plan.
+        from .paypal import revise, snapshot
+        live = snapshot(sub.paypal_subscription_id)['subscription']
+        if live.get('status') != 'ACTIVE':
+            raise HTTPException(409, f'The PayPal subscription is {live.get("status", "not active")}; it can’t be switched right now')
+        if live.get('plan_id') == deal.paypal_plan_id:
+            raise HTTPException(409, 'PayPal already bills this subscription on that plan')
+        previous_plan_id = live.get('plan_id')
+        approval_url = revise(sub.paypal_subscription_id, deal.paypal_plan_id, str(request.base_url))
+    # The plan on the Plans page becomes the approved offer. What it replaced is remembered so the switch can be undone.
+    sub.switches.append(SimulatedSwitch(deal_id=deal.id, deal_status=deal.status, previous_provider=sub.provider,
+                                        previous_plan_name=sub.plan_name, previous_monthly_cost_cents=sub.monthly_cost_cents,
+                                        previous_paypal_plan_id=previous_plan_id))
+    deal.current_plan, deal.current_monthly_cents, deal.annual_savings_cents = sub.plan_name, sub.monthly_cost_cents, live_savings(deal, sub)
+    sub.provider, sub.plan_name, sub.monthly_cost_cents = deal.provider or sub.provider, deal.plan_name or sub.plan_name, deal.target_monthly_cents
+    deal.status = 'mock_approved'
+    db.add(AuditEvent(event_type='scout.approve', entity_id=deal.id,
+                      details='PayPal revision requested' if via_paypal else 'Tracked in ReDeal; provider account not changed'))
     db.commit()
-    return {'decision': payload.decision, 'mode': 'simulation_only', 'realized_savings_cents': 0,
-            'message': 'Plan switched in the simulation. No real purchase, cancellation or account change occurred.' if payload.decision == 'approve' else 'Deal passed.'}
+    if via_paypal:
+        return {'decision': 'approve', 'mode': 'paypal', 'approval_url': approval_url, 'realized_savings_cents': 0,
+                'message': 'PayPal is switching your plan. Confirm the change on PayPal to finish.' if approval_url else 'PayPal switched your plan.'}
+    return {'decision': 'approve', 'mode': 'tracked', 'realized_savings_cents': 0,
+            'message': f'Switch saved. Finish it on {deal.provider}’s site; ReDeal can’t sign in to that account.'}
 
 
 # One scan at a time, in a background thread. The page polls /agent/scan/status,
@@ -281,6 +335,21 @@ def run_scan():
     skipped = 0
     with SessionLocal() as db:
         subs = db.scalars(select(Subscription).where(Subscription.status == 'active')).all()
+        # Plans billed through PayPal: the merchant's PayPal catalog is the source of truth, no web search needed.
+        paypal_subs = [s for s in subs if s.paypal_subscription_id]
+        subs = [s for s in subs if not s.paypal_subscription_id]
+        if paypal_subs:
+            _set_state(phase='paypal', done=0, total=len(paypal_subs))
+            for sub in paypal_subs:
+                try:
+                    f, r, k = scan_paypal(db, client, sub)
+                    found, rejected, skipped = found + f, rejected + r, skipped + k
+                except Exception as exc:
+                    db.rollback()
+                    detail = getattr(exc, 'detail', None) or str(exc)
+                    errors.append(f'{sub.provider} (PayPal): {str(detail)[:140]}')
+                finally:
+                    _bump()
         # Two entries for the same provider, plan and price would ask the AI the same questions twice.
         groups = {}
         for sub in subs:
@@ -337,7 +406,7 @@ def run_scan():
                             billing_period=assessment['billing_period'], upfront_cents=assessment['upfront_cents'],
                             eligibility=assessment['eligibility'], tradeoffs=assessment['tradeoffs'],
                             source_url=assessment['source_url'], status=assessment['status'],
-                            caveat='AI-assisted verification only. Check the provider before acting. This is a simulated offer.',
+                            caveat='Found and checked by AI on the web. Confirm the price on the provider’s site; approving saves the switch in ReDeal, and you finish it with the provider.',
                             review_reason=str(review.get('reason', ''))[:2000])
                         db.add(deal)
                         db.commit()
@@ -345,4 +414,47 @@ def run_scan():
                     except Exception as exc:
                         db.rollback()
                         errors.append(f'{sub.provider} candidate: {type(exc).__name__}: {str(exc)[:120]}')
-    return {'new_deals': found, 'rejected': rejected, 'skipped': skipped, 'errors': errors, 'message': 'Scan finished. Open Swipe Pile to review mock deals.'}
+    return {'new_deals': found, 'rejected': rejected, 'skipped': skipped, 'errors': errors, 'message': 'Scan finished. Open the Swipe Pile to review deals.'}
+
+
+def scan_paypal(db, client, sub):
+    """Read the subscription and its merchant's plan catalog from PayPal; the AI reviews each cheaper plan.
+    Returns (new deals, rejected, skipped)."""
+    from .paypal import BUYER_SUBSCRIPTIONS_URL, catalog, monthly_cents, plan_price, sync_subscription
+    snap = sync_subscription(db, sub)   # Plans page shows what PayPal really bills
+    db.commit()
+    current = snap['plan']
+    if snap['subscription'].get('status') != 'ACTIVE' or not current.get('product_id'):
+        return 0, 0, 0
+    found = rejected = skipped = 0
+    for plan in catalog(current['product_id']):
+        price = plan_price(plan)
+        if plan.get('id') == current.get('id') or price is None:
+            continue
+        target_monthly = monthly_cents(price)
+        annual_savings = sub.monthly_cost_cents * 12 - (price[0] if price[1] == 'yearly' else price[0] * 12)
+        if annual_savings <= 0:
+            rejected += 1
+            continue
+        # Skip if this plan is already waiting in the pile or the user passed on it. An approved card may come back
+        # if the subscription has since moved back to a pricier plan.
+        if db.scalar(select(ScoutDeal.id).where(ScoutDeal.subscription_id == sub.id, ScoutDeal.paypal_plan_id == plan['id'],
+                                                ScoutDeal.status.in_(OPEN + ('passed',))).limit(1)) is not None:
+            skipped += 1
+            continue
+        review = ai_compare(client, current, plan)
+        status = 'candidate' if review.get('comparable') else 'conditional'
+        db.add(ScoutDeal(
+            subscription_id=sub.id,
+            fingerprint=hashlib.sha256(json.dumps(['paypal', sub.id, plan['id'], price[0], _now()]).encode()).hexdigest(),
+            provider=sub.provider, plan_name=str(plan.get('name', 'Plan'))[:120],
+            current_plan=sub.plan_name, current_monthly_cents=sub.monthly_cost_cents,
+            target_monthly_cents=target_monthly, annual_savings_cents=annual_savings,
+            billing_period=price[1], upfront_cents=price[0] if price[1] == 'yearly' else 0,
+            eligibility=str(review.get('eligibility', ''))[:2000], tradeoffs=str(review.get('tradeoffs', ''))[:2000],
+            source_url=BUYER_SUBSCRIPTIONS_URL, status=status, paypal_plan_id=plan['id'],
+            caveat='Plan and price read from the merchant’s PayPal catalog (sandbox). Approving asks PayPal to switch this subscription; you confirm on PayPal.',
+            review_reason=str(review.get('reason', ''))[:2000]))
+        db.commit()
+        found += 1
+    return found, rejected, skipped

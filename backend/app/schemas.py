@@ -19,6 +19,9 @@ class SubscriptionRead(SubscriptionCreate):
     id: int
     status: str
     switch: SimulatedSwitchInfo | None = None
+    paypal_subscription_id: str | None = None
+    # Present right after a PayPal switch or undo: the buyer confirms the change on this PayPal page.
+    paypal_approval_url: str | None = None
 
 class OfferCreate(BaseModel):
     provider: str = Field(min_length=1, max_length=120)

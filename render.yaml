@@ -1,3 +1,4 @@
+# PayPal plan IDs and the demo subscription ID come from your local backend/.env.
 # Render Blueprint: one web service (API + UI) and a Postgres database.
 # In Render: New > Blueprint, pick this repository, then fill in the secrets it asks for.
 databases:

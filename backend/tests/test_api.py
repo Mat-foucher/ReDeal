@@ -84,3 +84,54 @@ def test_approve_switches_plan_and_undo_restores_it():
     assert set(mine()) == {bundle, ads, maxb} and mine()[bundle]['status'] == 'conditional'
     assert client.post(f"/subscriptions/{sub['id']}/undo-switch").status_code == 409
     client.delete(f"/subscriptions/{sub['id']}")
+
+
+def test_paypal_plan_found_switched_and_undone(monkeypatch):
+    """A plan billed via PayPal: the agent finds the cheaper catalog plan, approval revises it at PayPal, undo reverts."""
+    from app import agent_scout, paypal
+    from app.models import Subscription
+    plan = lambda pid, name, price: {'id': pid, 'name': name, 'product_id': 'PROD-1', 'status': 'ACTIVE', 'description': 'Demo',
+        'billing_cycles': [{'tenure_type': 'REGULAR', 'frequency': {'interval_unit': 'MONTH', 'interval_count': 1},
+                            'pricing_scheme': {'fixed_price': {'value': price, 'currency_code': 'USD'}}}]}
+    plans = {'P-STD': plan('P-STD', 'Standard', '25'), 'P-SAV': plan('P-SAV', 'Saver', '15')}
+    state = {'plan': 'P-STD', 'revisions': []}
+
+    def fake_paypal(method, path, body=None):
+        if path == '/v1/billing/subscriptions/I-TEST1':
+            return {'id': 'I-TEST1', 'status': 'ACTIVE', 'plan_id': state['plan']}
+        if path.startswith('/v1/billing/plans?'):
+            return {'plans': [{'id': p, 'status': 'ACTIVE'} for p in plans]}
+        if path.startswith('/v1/billing/plans/'):
+            return plans[path.rsplit('/', 1)[1]]
+        if path == '/v1/catalogs/products/PROD-1':
+            return {'name': 'Demo Membership'}
+        if path == '/v1/billing/subscriptions/I-TEST1/revise':
+            state['revisions'].append(body['plan_id'])
+            return {'links': [{'rel': 'approve', 'href': 'https://www.sandbox.paypal.com/approve'}]}
+        raise AssertionError(path)
+
+    monkeypatch.setattr(paypal, 'paypal_request', fake_paypal)
+    monkeypatch.setattr(agent_scout, 'ai_compare', lambda client, cur, new: {'comparable': True, 'eligibility': 'Any subscriber', 'tradeoffs': 'None listed', 'reason': 'Same service, lower price.'})
+    monkeypatch.setenv('PAYPAL_DEMO_SUBSCRIPTION_ID', 'I-TEST1')
+
+    linked = client.post('/paypal/link-demo').json()
+    assert linked['created'] and linked['subscription']['provider'] == 'Demo Membership'
+    assert linked['subscription']['monthly_cost_cents'] == 2500 and linked['subscription']['paypal_subscription_id'] == 'I-TEST1'
+    assert client.post('/paypal/link-demo').json()['created'] is False
+    sid = linked['subscription']['id']
+
+    with Session(engine) as db:
+        assert agent_scout.scan_paypal(db, None, db.get(Subscription, sid)) == (1, 0, 0)
+        assert agent_scout.scan_paypal(db, None, db.get(Subscription, sid)) == (0, 0, 1)  # already in the pile
+    deal = next(d for d in client.get('/agent/pile').json()['deals'] if d['subscription_id'] == sid)
+    assert (deal['paypal_plan_id'], deal['annual_savings_cents'], deal['status']) == ('P-SAV', 12000, 'candidate')
+
+    r = client.post(f"/agent/pile/{deal['id']}/swipe", json={'decision': 'approve'}).json()
+    assert r['mode'] == 'paypal' and r['approval_url'] and state['revisions'] == ['P-SAV']
+    now = next(s for s in client.get('/subscriptions').json() if s['id'] == sid)
+    assert (now['plan_name'], now['monthly_cost_cents']) == ('Saver', 1500)
+
+    state['plan'] = 'P-SAV'  # the buyer confirmed on PayPal
+    back = client.post(f'/subscriptions/{sid}/undo-switch').json()
+    assert state['revisions'] == ['P-SAV', 'P-STD'] and back['paypal_approval_url'] and back['monthly_cost_cents'] == 2500
+    client.delete(f'/subscriptions/{sid}')

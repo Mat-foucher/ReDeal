@@ -139,6 +139,7 @@ function h(tag, props, ...kids) {
 const ICONS = {
   card: '<rect x="3" y="5" width="18" height="14" rx="3"/><path d="M3 10h18"/>',
   pile: '<rect x="6" y="3" width="12" height="16" rx="3"/><path d="M9 22h6"/>',
+  link: '<path d="M10 14a4 4 0 0 0 5.7 0l3-3a4 4 0 0 0-5.7-5.7l-1 1"/><path d="M14 10a4 4 0 0 0-5.7 0l-3 3a4 4 0 0 0 5.7 5.7l1-1"/>',
   clock: '<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>',
   flask: '<path d="M9 3h6M10 3v6l-5 9a2 2 0 0 0 1.8 3h10.4a2 2 0 0 0 1.8-3l-5-9V3"/>',
   plus: '<path d="M12 5v14M5 12h14"/>',
@@ -367,6 +368,37 @@ async function loadAll() {
   renderAll();
 }
 function renderAll() { renderSubs(); renderPile(); renderActivity(); renderLabs(); updateBadge(); }
+
+/* ---------- PayPal ---------- */
+// After a PayPal switch, the buyer confirms on PayPal's own page. Opened from a tap so pop-up blockers allow it.
+function paypalConfirmSheet(url, message) {
+  openSheet({ title: 'Confirm in PayPal', build: ctl => [
+    h('p', { class: 't-sub dim sheet-msg' }, message),
+    h('a', { href: url, class: 'btn block press', rel: 'noopener', onclick: () => ctl.close() }, 'Continue to PayPal'),
+    foot('PayPal sandbox. You sign in as your sandbox buyer and approve the new plan; PayPal then sends you back here.'),
+  ] });
+}
+async function linkPaypal() {
+  try {
+    const r = await api('/paypal/link-demo', { method: 'POST' });
+    toast(r.created ? `${r.subscription.provider} added from PayPal` : `${r.subscription.provider} is already in your plans`, 'ok');
+    await loadAll();
+    go('subs');
+  } catch (e) { toast(e.message, 'err'); }
+}
+// PayPal sends the buyer back with ?paypal=approved or ?paypal=cancelled; re-read what PayPal now bills.
+async function handlePaypalReturn() {
+  const p = new URLSearchParams(location.search).get('paypal');
+  const hasLinked = S.subs.some(s => s.paypal_subscription_id);
+  if (!p && !hasLinked) return;
+  if (p) history.replaceState(null, '', location.pathname + location.hash);
+  try {
+    await api('/paypal/sync', { method: 'POST' });
+    await Promise.all([loadSubs(), loadPile()]);
+    if (p === 'approved') toast('PayPal confirmed the change. Your plan is updated.', 'ok');
+    if (p === 'cancelled') toast('You cancelled in PayPal, so PayPal kept your old plan.');
+  } catch (e) { if (p) toast(e.message, 'err'); }
+}
 function updateBadge() {
   const b = $('#pile-badge');
   b.hidden = !S.pile.length;
@@ -385,15 +417,17 @@ function renderSubs() {
   const kids = [head(S.loaded ? `${S.subs.filter(s => s.status === 'active').length} active` : 'Loading', 'Subscriptions', addBtn)];
   if (S.offline) kids.push(offlineState());
   else if (S.loaded && !S.subs.length) {
-    kids.push(emptyState('card', 'No subscriptions yet', 'Add what you pay each month and ReDeal will scout for cheaper plans.',
-      h('button', { type: 'button', class: 'btn press', onclick: openAddSub }, 'Add Subscription')));
+    kids.push(emptyState('card', 'No subscriptions yet', 'Add what you pay each month, or bring in a plan billed through PayPal, and ReDeal’s AI agent will find cheaper plans.',
+      h('div', { class: 'btn-row' },
+        h('button', { type: 'button', class: 'btn press', onclick: openAddSub }, 'Add Subscription'),
+        h('button', { type: 'button', class: 'btn gray press', onclick: linkPaypal }, icon('link', 20), 'Add from PayPal'))));
   } else if (S.subs.length) {
     const monthly = S.subs.reduce((n, s) => n + s.monthly_cost_cents, 0);
     const saved = S.subs.reduce((n, s) => n + switchSaving(s), 0);
     kids.push(
       h('section', { class: 'surface' },
         h('div', null, h('div', { class: 't-foot dim', style: 'font-weight:600' }, 'Monthly spend'), h('div', { class: 'hero-num num' }, money(monthly)),
-          saved > 0 && h('div', { class: 't-headline green num saved-line' }, `Saving ${money(saved * 12)} per year`, h('span', { class: 't-foot dim' }, ' · simulated'))),
+          saved > 0 && h('div', { class: 't-headline green num saved-line' }, `Saving ${money(saved * 12)} per year`, h('span', { class: 't-foot dim' }, ' · projected'))),
         h('div', { class: 'stats' },
           h('div', { class: 'stat' }, h('span', { class: 't-cap dim' }, 'Per year'), h('b', { class: 'num' }, money(monthly * 12))),
           h('button', { type: 'button', class: 'stat press', style: 'text-align:left', onclick: () => go('pile') },
@@ -403,11 +437,12 @@ function renderSubs() {
           h('button', { type: 'button', class: 'row has-mono press', onclick: () => openSubDetail(s) },
             mono(s.provider),
             h('span', { class: 'grow' }, h('span', { class: 't-headline' }, s.provider),
-              h('span', { class: 't-sub dim' }, s.switch ? `${s.plan_name} · was ${s.switch.original_provider} ${s.switch.original_plan_name}` : `${s.plan_name} · ${cap(s.category)}`)),
+              h('span', { class: 't-sub dim' }, s.switch ? `${s.plan_name} · was ${s.switch.original_provider} ${s.switch.original_plan_name}` : `${s.plan_name} · ${s.paypal_subscription_id ? 'Billed via PayPal' : cap(s.category)}`)),
             h('span', { class: 'price-col' }, h('span', { class: 'num' }, money(s.monthly_cost_cents)),
               switchSaving(s) > 0 && h('span', { class: 't-foot green num' }, `saves ${money(switchSaving(s))}`)),
             h('span', { class: 'chev' }, icon('chev', 16, 2.5))))),
-        foot(saved > 0 ? 'Switched plans are simulated: approving a deal changes the plan here, not with the provider.' : 'Prices are what you entered. Nothing is changed with any provider.')));
+        !S.subs.some(s => s.paypal_subscription_id) && h('button', { type: 'button', class: 'btn sm gray press', onclick: linkPaypal }, icon('link', 18), 'Add a Plan Billed via PayPal'),
+        foot('Plans billed via PayPal are switched through PayPal when you approve a deal. For other plans, ReDeal tracks the switch and you finish it on the provider’s site.')));
   }
   v.replaceChildren(...kids);
 }
@@ -522,7 +557,10 @@ function openSubDetail(sub) {
         infoRow('Per year', money(sub.monthly_cost_cents * 12)),
         infoRow('Cancellation fee', money(sub.cancellation_fee_cents)),
         infoRow('Status', cap(sub.status))),
-      sub.switch && section('Simulated switch',
+      sub.paypal_subscription_id && section('PayPal', h('div', { class: 'group' },
+        infoRow('Billed via', 'PayPal (sandbox)'),
+        infoRow('Subscription', sub.paypal_subscription_id))),
+      sub.switch && section('Switched plan',
         h('div', { class: 'group' },
           infoRow('Switched from', `${sub.switch.original_provider} ${sub.switch.original_plan_name}`),
           infoRow('Was', `${money(sub.switch.original_monthly_cost_cents)} per month`),
@@ -535,9 +573,10 @@ function openSubDetail(sub) {
             toast(`Back to ${back.provider} ${back.plan_name}. The deal is in the pile again.`, 'ok');
             await Promise.all([loadPile(), loadHistory()]).catch(() => {});
             renderAll();
+            if (back.paypal_approval_url) paypalConfirmSheet(back.paypal_approval_url, `PayPal is switching ${back.provider} back to ${back.plan_name}. Confirm it on PayPal to finish.`);
           } catch (e) { toast(e.message, 'err'); }
         } }, sub.switch.steps > 1 ? 'Undo Last Switch' : 'Undo Switch'),
-        foot('Simulation only. No provider account was changed, so there is nothing to cancel.')),
+        foot(sub.paypal_subscription_id ? 'Undo asks PayPal to switch back to the previous plan.' : 'ReDeal tracks this switch. If you already changed plans with the provider, undo it there too.')),
       section('Manual offers',
         segmented([6, 12, 24].map(m => ({ value: m, label: `${m} months` })), months, m => { months = m; refresh(); }, 'Comparison horizon'),
         offersBox),
@@ -595,6 +634,7 @@ function openAddOffer(sub, done) {
 let topCard = null;
 function dealBadges(d) {
   const out = [];
+  if (d.paypal_plan_id) out.push(h('span', { class: 'badge green' }, 'Switches via PayPal'));
   if (d.status === 'conditional') out.push(h('span', { class: 'badge orange' }, 'Conditional · check eligibility'));
   if (d.billing_period === 'yearly') out.push(h('span', { class: 'badge' }, `Billed yearly · ${money(d.upfront_cents)} upfront`));
   return out.length ? h('div', { class: 'badges' }, out) : null;
@@ -626,12 +666,12 @@ function renderPile() {
   topCard = null;
   const scanBtn = h('button', { type: 'button', class: 'icon-btn press', 'aria-label': S.scanning ? 'Scan in progress' : 'Scan for deals with AI', disabled: S.scanning, onclick: startScan },
     S.scanning ? h('span', { class: 'spinner' }) : icon('sparkle'));
-  const kids = [head(`${plural(S.pile.length, 'deal')} · simulation only`, 'Swipe Pile', scanBtn)];
+  const kids = [head(`${plural(S.pile.length, 'deal')} found by AI`, 'Swipe Pile', scanBtn)];
   if (S.scanning) kids.push(h('div', { class: 'inline-status', role: 'status' }, h('span', { class: 'spinner' }), h('span', { id: 'scan-status-text' }, scanText())));
   if (S.offline) kids.push(offlineState());
   else if (!S.pile.length) {
     kids.push(S.subs.length
-      ? emptyState('pile', S.scanning ? 'Scanning…' : 'You’re all caught up', 'Scan to research cheaper plans for your subscriptions. Every swipe is a simulation; no account is changed.',
+      ? emptyState('pile', S.scanning ? 'Scanning…' : 'You’re all caught up', 'Scan and ReDeal’s AI agent looks for cheaper plans: in the merchant’s PayPal catalog for plans billed via PayPal, and on the web for the rest. Nothing changes until you approve.',
           !S.scanning && h('button', { type: 'button', class: 'btn press', onclick: startScan }, icon('sparkle', 20), 'Scan for Deals with AI'))
       : emptyState('pile', 'Nothing to scout yet', 'Add a subscription with its monthly price, then scan for deals.',
           h('button', { type: 'button', class: 'btn press', onclick: () => { go('subs'); openAddSub(); } }, 'Add Subscription')));
@@ -647,7 +687,7 @@ function renderPile() {
     });
     kids.push(deck, h('div', { class: 'actions' },
       h('button', { type: 'button', class: 'round press', 'aria-label': 'Pass', onclick: () => flingTop(-1) }, icon('x', 26, 2.6)),
-      h('button', { type: 'button', class: 'round yes press', 'aria-label': 'Approve (simulation)', onclick: () => flingTop(1) }, icon('check', 26, 2.6))));
+      h('button', { type: 'button', class: 'round yes press', 'aria-label': 'Approve', onclick: () => flingTop(1) }, icon('check', 26, 2.6))));
   }
   v.replaceChildren(...kids);
 }
@@ -735,7 +775,8 @@ async function commitSwipe(deal, decision) {
   if (hadFocus) { const deck = $('.deck'); if (deck) deck.focus({ preventScroll: true }); }
   try {
     const r = await api(`/agent/pile/${deal.id}/swipe`, { method: 'POST', body: { decision } });
-    toast(r.message, decision === 'approve' ? 'ok' : '');
+    if (r.approval_url) paypalConfirmSheet(r.approval_url, `ReDeal asked PayPal to move ${deal.provider} to ${deal.plan_name} (${money(deal.target_monthly_cents)}/mo). Confirm it on PayPal to finish.`);
+    else toast(r.message, decision === 'approve' ? 'ok' : '');
     loadHistory().catch(() => {});
     // An approval switches the plan, which also re-prices the cards left in the pile.
     if (decision === 'approve') Promise.all([loadSubs(), loadPile()]).catch(() => {});
@@ -748,6 +789,7 @@ function scanText() {
   const p = S.scan;
   const tail = ' You can leave this page; the scan keeps running.';
   if (!p || !p.total) return 'Starting the scan…' + tail;
+  if (p.phase === 'paypal') return `Checking PayPal plan catalogs: ${p.done} of ${p.total} done.` + tail;
   if (p.phase === 'research') return `Researching offers: ${p.done} of ${plural(p.total, 'subscription')} done.` + tail;
   return `Reviewing offers: ${p.done} of ${p.total} checked.` + tail;
 }
@@ -780,7 +822,7 @@ async function startScan() {
   if (!S.subs.length) { toast('Add a subscription first.'); return; }
   const ok = await confirmSheet({
     title: 'Scan for Deals with AI',
-    message: `ReDeal researches ${plural(S.subs.filter(s => s.status === 'active').length, 'active subscription')} with OpenAI web search, then runs a separate review of each candidate. This uses your API key, incurs charges, and can take a minute or two.`,
+    message: `ReDeal’s agent checks ${plural(S.subs.filter(s => s.status === 'active').length, 'active subscription')}: plans billed via PayPal against the merchant’s PayPal catalog, the rest with OpenAI web search, then an AI review of each candidate. This uses your OpenAI API key and can take a minute or two.`,
     confirm: 'Start Scan',
   });
   if (!ok) return;
@@ -793,7 +835,8 @@ async function startScan() {
     if (e.status === 409) pollScan(); else toast(e.message, 'err');
   }
 }
-const STATUS = { candidate: 'In pile', conditional: 'In pile · conditional', mock_approved: 'Approved · simulation', passed: 'Passed' };
+const STATUS = { candidate: 'In pile', conditional: 'In pile · conditional', mock_approved: 'Approved', passed: 'Passed' };
+const statusText = d => (d.status === 'mock_approved' ? (d.paypal_plan_id ? 'Approved · switched via PayPal' : 'Approved · finish with provider') : STATUS[d.status] || d.status);
 function openDealDetail(d, canAct) {
   openSheet({
     title: 'Deal Details',
@@ -808,7 +851,7 @@ function openDealDetail(d, canAct) {
       d.tradeoffs && section('Trade-offs', h('div', { class: 'group' }, h('p', { class: 'row t-sub' }, d.tradeoffs))),
       d.review_reason && section('AI review', h('div', { class: 'group' }, h('p', { class: 'row t-sub' }, d.review_reason))),
       h('div', { class: 'group' },
-        infoRow('Status', STATUS[d.status] || d.status),
+        infoRow('Status', statusText(d)),
         infoRow('Billing', cap(d.billing_period)),
         d.source_url && h('div', { class: 'row wrap' }, h('span', { class: 'grow' }, h('span', null, 'Source')), safeLink(d.source_url, null, 'trail'))),
       d.caveat && foot(d.caveat),
@@ -840,10 +883,10 @@ function renderActivity() {
         ? section(null, h('div', { class: 'group' }, list.map(d =>
             h('button', { type: 'button', class: 'row has-mono press', onclick: () => openDealDetail(d, false) },
               mono(d.provider),
-              h('span', { class: 'grow' }, h('span', { class: 't-headline' }, d.plan_name), h('span', { class: 't-sub dim' }, STATUS[d.status] || d.status)),
+              h('span', { class: 'grow' }, h('span', { class: 't-headline' }, d.plan_name), h('span', { class: 't-sub dim' }, statusText(d))),
               h('span', { class: 'num ' + (d.status === 'mock_approved' ? 'green' : 'dim') }, `${moneyShort(d.annual_savings_cents)}/yr`),
               h('span', { class: 'chev' }, icon('chev', 16, 2.5))))),
-          foot('Approvals are simulations. No purchase, cancellation, or account change occurs, so realized savings stay at zero.'))
+          foot('Savings are projected from approvals. Realized savings count only once a lower charge is verified, so they start at zero.'))
         : emptyState('clock', 'Nothing here yet', S.filter === 'all' ? 'Deals you approve or pass will appear here.' : 'No deals match this filter.'));
     if (S.switches.length) {
       kids.push(section('Manual switch requests', h('div', { class: 'group' }, S.switches.map(r => {
@@ -931,7 +974,10 @@ function openRevise(deal) {
 }
 function renderLabs() {
   const v = $('#view-labs');
-  const pp = S.pp, kids = [head('Sandbox and legacy', 'Labs')];
+  const pp = S.pp, kids = [head('PayPal sandbox tools', 'Labs')];
+  kids.push(section('Your PayPal plan',
+    h('button', { type: 'button', class: 'btn sm press', onclick: linkPaypal }, icon('link', 18), 'Add Sandbox Subscription to Plans'),
+    foot('Brings the subscription in PAYPAL_DEMO_SUBSCRIPTION_ID into Plans, priced from PayPal. Then scan in the Swipe Pile: the agent finds cheaper plans in the merchant’s PayPal catalog, and approving one switches it through PayPal.')));
   // PayPal sandbox
   const ppKids = [];
   if (!pp || pp.loading) ppKids.push(h('div', { class: 'inline-status' }, h('span', { class: 'spinner' }), 'Checking the sandbox subscription…'));
@@ -956,7 +1002,7 @@ function renderLabs() {
     if (!pp.data.deals.length) ppKids.push(foot('No eligible sandbox deal right now.'));
     ppKids.push(foot(pp.data.note), h('button', { type: 'button', class: 'btn sm gray press', onclick: loadPaypal }, 'Refresh'));
   }
-  kids.push(section('PayPal sandbox', ppKids));
+  kids.push(section('Manual plan switch', ppKids));
   kids.push(section('Start a sandbox subscription',
     h('div', { class: 'btn-row' },
       h('button', { type: 'button', class: 'btn sm gray press', onclick: () => startSandboxSub('standard') }, 'Standard'),
@@ -1021,4 +1067,4 @@ window.addEventListener('hashchange', () => go(location.hash.slice(1)));
 
 renderAll();
 go(location.hash.slice(1) || 'subs', true);
-loadAll().then(pollScan);
+loadAll().then(() => { pollScan(); handlePaypalReturn(); });

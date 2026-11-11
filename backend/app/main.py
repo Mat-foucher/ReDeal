@@ -5,16 +5,17 @@ from dotenv import load_dotenv
 from pathlib import Path
 load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 from datetime import datetime, timezone
-from fastapi import Depends, FastAPI, HTTPException, Query, Response
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
-from .database import Base, engine, get_db
+from .database import Base, add_missing_columns, engine, get_db
 from .models import AuditEvent, Offer, ScoutDeal, Subscription, SwitchRequest
 from .schemas import Evaluation, OfferCreate, OfferRead, SubscriptionCreate, SubscriptionRead, SwitchRead
 
-Base.metadata.create_all(bind=engine)  # MVP only; replace with Alembic migrations before production
-app = FastAPI(title='ReDealer API', version='0.1.0')
+Base.metadata.create_all(bind=engine)
+add_missing_columns()
+app = FastAPI(title='ReDeal API', version='0.6.0')
 app.add_middleware(CORSMiddleware, allow_origins=['http://localhost:3000', 'http://127.0.0.1:3000'], allow_methods=['*'], allow_headers=['*'])
 
 # Optional password gate for public hosting. Set APP_PASSWORD (and optionally APP_USERNAME) and every
@@ -78,23 +79,31 @@ def update_subscription(subscription_id: int, payload: SubscriptionCreate, db: S
     return sub
 
 @app.post('/subscriptions/{subscription_id}/undo-switch', response_model=SubscriptionRead)
-def undo_switch(subscription_id: int, db: Session = Depends(get_db)):
-    """Undo the most recent simulated switch: the plan goes back to what it replaced and the deal returns to the pile."""
+def undo_switch(subscription_id: int, request: Request, db: Session = Depends(get_db)):
+    """Undo the most recent switch: the plan goes back to what it replaced and the deal returns to the pile.
+    For a PayPal-billed plan, ReDeal also asks PayPal to switch the subscription back."""
     sub = db.get(Subscription, subscription_id)
     if sub is None:
         raise HTTPException(404, 'Subscription not found')
     if not sub.switches:
-        raise HTTPException(409, 'This subscription has no simulated switch to undo')
+        raise HTTPException(409, 'This subscription has no switch to undo')
     last = sub.switches[-1]
+    approval_url = None
+    if sub.paypal_subscription_id and last.previous_paypal_plan_id:
+        from .paypal import revise
+        approval_url = revise(sub.paypal_subscription_id, last.previous_paypal_plan_id, str(request.base_url))
     sub.provider, sub.plan_name, sub.monthly_cost_cents = last.previous_provider, last.previous_plan_name, last.previous_monthly_cost_cents
     deal = db.get(ScoutDeal, last.deal_id) if last.deal_id else None
     if deal is not None and deal.subscription_id == sub.id and deal.status == 'mock_approved':
         deal.status = last.deal_status
     sub.switches.remove(last)
-    db.add(AuditEvent(event_type='subscription.switch_undone', entity_id=sub.id, details='Simulation only; no provider action'))
+    db.add(AuditEvent(event_type='subscription.switch_undone', entity_id=sub.id,
+                      details='PayPal revision requested' if last.previous_paypal_plan_id else 'Tracked in ReDeal only'))
     db.commit()
     db.refresh(sub)
-    return sub
+    out = SubscriptionRead.model_validate(sub)
+    out.paypal_approval_url = approval_url
+    return out
 
 @app.delete('/subscriptions/{subscription_id}', status_code=204)
 def delete_subscription(subscription_id: int, db: Session = Depends(get_db)):
