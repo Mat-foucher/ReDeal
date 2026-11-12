@@ -378,7 +378,11 @@ function paypalConfirmSheet(url, message) {
     foot('PayPal sandbox. You sign in as your sandbox buyer and approve the new plan; PayPal then sends you back here.'),
   ] });
 }
+let linking = false;   // ignore extra taps while an import is in flight
 async function linkPaypal() {
+  if (linking) return;
+  linking = true;
+  setTimeout(() => { linking = false; }, 4000);
   try {
     const r = await api('/paypal/link-demo', { method: 'POST' });
     toast(r.created ? `${r.subscription.provider} added from PayPal` : `${r.subscription.provider} is already in your plans`, 'ok');

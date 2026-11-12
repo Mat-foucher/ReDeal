@@ -7,6 +7,7 @@ ReDeal's agent loop for PayPal-billed plans:
      the buyer confirms the change on PayPal's own approval page.
 """
 import os
+import threading
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
@@ -183,12 +184,41 @@ async def get_subscription(subscription_id: str):
     return {'id': data.get('id'), 'status': data.get('status'), 'plan_id': data.get('plan_id'), 'billing_info': data.get('billing_info')}
 
 
+def remove_duplicate_links(db: Session) -> int:
+    """Keep one ReDeal plan per PayPal subscription (the oldest); delete any extras and what hangs off them.
+    Duplicates came from two imports racing each other, e.g. a double tap. Returns how many were removed."""
+    from sqlalchemy import delete
+    from .models import Offer, ScoutDeal, SimulatedSwitch, SwitchRequest
+    seen, removed = set(), 0
+    for sub in db.scalars(select(Subscription).where(Subscription.paypal_subscription_id.is_not(None)).order_by(Subscription.id)).all():
+        if sub.paypal_subscription_id not in seen:
+            seen.add(sub.paypal_subscription_id)
+            continue
+        for model in (ScoutDeal, SwitchRequest, Offer, SimulatedSwitch):
+            db.execute(delete(model).where(model.subscription_id == sub.id))
+        db.delete(sub)
+        removed += 1
+    if removed:
+        db.add(AuditEvent(event_type='subscription.duplicates_removed', entity_id=0, details=f'{removed} duplicate PayPal plan(s)'))
+        db.commit()
+    return removed
+
+
+_link_lock = threading.Lock()
+
+
 @router.post('/link-demo')
 def link_demo(db: Session = Depends(get_db)):
     """Add the sandbox subscription from PAYPAL_DEMO_SUBSCRIPTION_ID to Plans, priced from PayPal."""
     sid = os.getenv('PAYPAL_DEMO_SUBSCRIPTION_ID', '').strip()
     if not sid:
         raise HTTPException(503, 'Set PAYPAL_DEMO_SUBSCRIPTION_ID in backend/.env first')
+    with _link_lock:   # two taps at once must not both create it
+        return _link(db, sid)
+
+
+def _link(db: Session, sid: str):
+    remove_duplicate_links(db)
     sub = db.scalar(select(Subscription).where(Subscription.paypal_subscription_id == sid))
     created = sub is None
     if created:
@@ -211,6 +241,7 @@ def sync_all(db: Session = Depends(get_db)):
     """Refresh every PayPal-billed plan from PayPal (after the buyer returns from an approval page, say)."""
     if not configured():
         return {'synced': 0, 'errors': []}
+    remove_duplicate_links(db)
     synced, errors = 0, []
     for sub in db.scalars(select(Subscription).where(Subscription.paypal_subscription_id.is_not(None))).all():
         try:

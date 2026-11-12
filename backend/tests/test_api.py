@@ -179,3 +179,42 @@ def test_sample_data_replaces_everything_and_resets_paypal(monkeypatch):
         monkeypatch.delenv(k)
     r = client.post('/sample/load').json()
     assert r['subscriptions'] == 3 and r['paypal'] == 'not_configured'
+
+
+def test_paypal_import_never_duplicates(monkeypatch):
+    """Simultaneous imports create one plan, and an existing duplicate is cleaned up on the next import or sync."""
+    import threading
+    from app import paypal
+    from app.models import Subscription
+    plan = {'id': 'P-STD', 'name': 'Standard', 'product_id': 'PROD-1', 'status': 'ACTIVE',
+            'billing_cycles': [{'tenure_type': 'REGULAR', 'frequency': {'interval_unit': 'MONTH', 'interval_count': 1},
+                                'pricing_scheme': {'fixed_price': {'value': '25', 'currency_code': 'USD'}}}]}
+
+    def fake_paypal(method, path, body=None):
+        if path == '/v1/billing/subscriptions/I-DUP1':
+            return {'id': 'I-DUP1', 'status': 'ACTIVE', 'plan_id': 'P-STD'}
+        if path.startswith('/v1/billing/plans/'):
+            return plan
+        if path == '/v1/catalogs/products/PROD-1':
+            return {'name': 'Demo Membership'}
+        raise AssertionError(path)
+
+    monkeypatch.setattr(paypal, 'paypal_request', fake_paypal)
+    for k, v in {'PAYPAL_ENVIRONMENT': 'sandbox', 'PAYPAL_CLIENT_ID': 'x', 'PAYPAL_CLIENT_SECRET': 'y', 'PAYPAL_DEMO_SUBSCRIPTION_ID': 'I-DUP1'}.items():
+        monkeypatch.setenv(k, v)
+    count = lambda: sum(1 for s in client.get('/subscriptions').json() if s['paypal_subscription_id'] == 'I-DUP1')
+
+    threads = [threading.Thread(target=lambda: client.post('/paypal/link-demo')) for _ in range(4)]
+    for t in threads: t.start()
+    for t in threads: t.join()
+    assert count() == 1
+
+    with Session(engine) as db:   # a duplicate left over from before the fix
+        db.add(Subscription(provider='Demo Membership', category='digital', plan_name='Standard', monthly_cost_cents=2500, paypal_subscription_id='I-DUP1'))
+        db.commit()
+    assert count() == 2
+    client.post('/paypal/sync')
+    assert count() == 1
+    for s in client.get('/subscriptions').json():
+        if s['paypal_subscription_id'] == 'I-DUP1':
+            client.delete(f"/subscriptions/{s['id']}")
