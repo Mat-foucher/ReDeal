@@ -40,3 +40,11 @@ def test_malformed_ai_json_is_reported():
     from app.agent_scout import parse_json
     with pytest.raises(ValueError, match='malformed JSON'):
         parse_json('{"candidates": [}')
+
+
+def test_errors_never_echo_api_keys():
+    from app.agent_scout import describe_error
+    AuthenticationError = type('AuthenticationError', (Exception,), {})
+    msg = describe_error(AuthenticationError("Incorrect API key provided: sk-proj-abc123"))
+    assert 'sk-proj' not in msg and 'rejected the API key' in msg
+    assert describe_error(ValueError('boom')) == 'ValueError: boom'

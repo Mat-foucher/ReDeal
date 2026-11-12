@@ -272,6 +272,19 @@ def _bump():
         _scan_state['done'] += 1
 
 
+def describe_error(exc) -> str:
+    """Short, safe text for a failed AI or PayPal call. Never echoes API keys or raw provider payloads."""
+    name = type(exc).__name__
+    if name == 'AuthenticationError':
+        return 'OpenAI rejected the API key. Check OPENAI_API_KEY in your settings (no quotes or spaces).'
+    if name == 'RateLimitError':
+        return 'OpenAI rate limit or quota reached. Check your OpenAI billing and limits.'
+    if name == 'PermissionDeniedError':
+        return 'This OpenAI key has no access to the model or web search.'
+    detail = getattr(exc, 'detail', None) or str(exc)
+    return f'{name}: {str(detail)[:120]}'
+
+
 def _snapshot():
     with _state_lock:
         return dict(_scan_state)
@@ -302,7 +315,7 @@ def _scan_job():
     try:
         result = run_scan()
     except Exception as exc:
-        result = {'new_deals': 0, 'rejected': 0, 'skipped': 0, 'errors': [f'{type(exc).__name__}: {str(exc)[:160]}'], 'message': 'Scan failed.'}
+        result = {'new_deals': 0, 'rejected': 0, 'skipped': 0, 'errors': [describe_error(exc)], 'message': 'Scan failed.'}
     _set_state(running=False, phase='idle', finished_at=_now(), result=result)
 
 
@@ -326,7 +339,7 @@ def already_seen(db, sub, candidate, assessment):
 def run_scan():
     """Research and review run in parallel; identical subscriptions share one round of AI calls."""
     from openai import OpenAI
-    client = OpenAI(api_key=os.environ['OPENAI_API_KEY'], timeout=90, max_retries=1)
+    client = OpenAI(api_key=os.environ['OPENAI_API_KEY'].strip().strip('"').strip("'"), timeout=90, max_retries=1)
     workers = max(1, int(os.getenv('SCOUT_MAX_PARALLEL', '6')))
     today = datetime.now(timezone.utc).date().isoformat()
     errors = []
@@ -346,8 +359,7 @@ def run_scan():
                     found, rejected, skipped = found + f, rejected + r, skipped + k
                 except Exception as exc:
                     db.rollback()
-                    detail = getattr(exc, 'detail', None) or str(exc)
-                    errors.append(f'{sub.provider} (PayPal): {str(detail)[:140]}')
+                    errors.append(f'{sub.provider} (PayPal): {describe_error(exc)}')
                 finally:
                     _bump()
         # Two entries for the same provider, plan and price would ask the AI the same questions twice.
@@ -379,14 +391,14 @@ def run_scan():
                 try:
                     candidates.extend((group, candidate) for candidate in future.result())
                 except Exception as exc:
-                    errors.append(f'{group[0].provider}: {type(exc).__name__}: {str(exc)[:120]}')
+                    errors.append(f'{group[0].provider}: {describe_error(exc)}')
             _set_state(phase='review', done=0, total=len(candidates))
             verify_jobs = [(group, candidate, pool.submit(verify, group[0].provider, group[0].plan_name, candidate)) for group, candidate in candidates]
             for group, candidate, future in verify_jobs:
                 try:
                     review = future.result()
                 except Exception as exc:
-                    errors.append(f'{group[0].provider} candidate: {type(exc).__name__}: {str(exc)[:120]}')
+                    errors.append(f'{group[0].provider} candidate: {describe_error(exc)}')
                     continue
                 for sub in group:
                     try:
@@ -413,7 +425,7 @@ def run_scan():
                         found += 1
                     except Exception as exc:
                         db.rollback()
-                        errors.append(f'{sub.provider} candidate: {type(exc).__name__}: {str(exc)[:120]}')
+                        errors.append(f'{sub.provider} candidate: {describe_error(exc)}')
     return {'new_deals': found, 'rejected': rejected, 'skipped': skipped, 'errors': errors, 'message': 'Scan finished. Open the Swipe Pile to review deals.'}
 
 
