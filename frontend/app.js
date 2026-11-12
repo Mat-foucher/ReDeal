@@ -933,12 +933,7 @@ const activityFilter = segmented(
   [{ value: 'all', label: 'All' }, { value: 'approved', label: 'Approved' }, { value: 'passed', label: 'Passed' }, { value: 'open', label: 'In Pile' }],
   S.filter, f => { S.filter = f; renderActivity(); }, 'Filter');
 
-/* ---------- Labs: PayPal sandbox + legacy web scout ---------- */
-async function loadPaypal() {
-  S.pp = { loading: true }; renderLabs();
-  try { S.pp = { data: await api('/demo/deals') }; } catch (e) { S.pp = { error: e.message }; }
-  renderLabs();
-}
+/* ---------- Labs: demo data, PayPal sandbox tools, legacy web scout ---------- */
 async function loadScout() {
   try { S.scout = await api('/scout/deals'); } catch (e) { S.scout = { deals: [], errors: [{ provider: 'Scout', reason: e.message }], scanned_at: null }; }
   renderLabs();
@@ -968,69 +963,15 @@ async function startSandboxSub(plan) {
     ] });
   } catch (e) { toast(e.message, 'err'); }
 }
-function openRevise(deal) {
-  const key = field('Action key', { type: 'password', placeholder: 'Local demo key', autocomplete: 'off' });
-  const err = h('p', { class: 'form-error', role: 'alert' });
-  const resultBox = h('div', { class: 'section' });
-  async function submit(ctl) {
-    if (!key.input.value) { err.textContent = 'Enter the local demo action key from backend/.env.'; return; }
-    ctl.busy(true);
-    try {
-      const r = await api('/demo/revise', { method: 'POST', body: { deal_id: deal.id, approve: true }, headers: { 'X-Demo-Action-Key': key.input.value } });
-      key.input.value = '';
-      err.textContent = '';
-      resultBox.replaceChildren(
-        h('div', { class: 'inline-status' }, r.message),
-        r.approval_url ? safeLink(r.approval_url, 'Authorize in PayPal Sandbox', 'btn block') : null);
-      loadPaypal();
-    } catch (e) { err.textContent = e.message; ctl.busy(false); }
-  }
-  openSheet({
-    title: 'Approve Switch',
-    action: { label: 'Approve', run: submit },
-    build: ctl => h('form', { novalidate: true, onsubmit: e => { e.preventDefault(); submit(ctl); } },
-      h('div', { class: 'item-head' }, mono(deal.provider, true),
-        h('div', { class: 'grow' }, h('span', { class: 't-title2' }, `${deal.current_plan} to ${deal.target_plan}`), h('span', { class: 't-sub dim' }, deal.provider))),
-      priceTiles({ current_monthly_cents: deal.current_monthly_cents, target_monthly_cents: deal.target_monthly_cents }),
-      section(null, h('div', { class: 'group' }, key.row), foot('The key is sent once with this request and is never stored. ' + deal.caveat)),
-      err, resultBox,
-      h('button', { type: 'submit', class: 'btn block press' }, 'Approve and Revise Plan')),
-  });
-}
 function renderLabs() {
   const v = $('#view-labs');
-  const pp = S.pp, kids = [head('PayPal sandbox tools', 'Labs')];
+  const kids = [head('PayPal sandbox tools', 'Labs')];
   kids.push(section('Demo data',
     h('button', { type: 'button', class: 'btn sm gray danger press', onclick: loadSample }, 'Reset to Sample Data'),
     foot('Starts over with Spotify, Netflix, YouTube Premium and the PayPal sandbox plan. If an earlier visitor switched the PayPal plan, you’ll be asked to confirm moving it back on PayPal.')));
   kids.push(section('Your PayPal plan',
     h('button', { type: 'button', class: 'btn sm press', onclick: linkPaypal }, icon('link', 18), 'Add Sandbox Subscription to Plans'),
     foot('Brings the subscription in PAYPAL_DEMO_SUBSCRIPTION_ID into Plans, priced from PayPal. Then scan in the Swipe Pile: the agent finds cheaper plans in the merchant’s PayPal catalog, and approving one switches it through PayPal.')));
-  // PayPal sandbox
-  const ppKids = [];
-  if (!pp || pp.loading) ppKids.push(h('div', { class: 'inline-status' }, h('span', { class: 'spinner' }), 'Checking the sandbox subscription…'));
-  else if (pp.error) ppKids.push(h('div', { class: 'group' }, h('div', { class: 'row wrap' }, h('span', { class: 'grow' }, h('span', { class: 't-headline' }, 'Not available'), h('span', { class: 't-sub dim', style: 'white-space:normal' }, pp.error)))),
-    h('button', { type: 'button', class: 'btn sm gray press', onclick: loadPaypal }, 'Check Again'));
-  else {
-    const s = pp.data.subscription, lp = s.last_payment;
-    ppKids.push(h('div', { class: 'group' },
-      infoRow('Subscription', s.id), infoRow('Status', s.status || '—'), infoRow('Current plan', s.current_plan),
-      infoRow('Next billing', s.next_billing_time ? fmtDate(s.next_billing_time) : '—'),
-      infoRow('Last payment', lp && lp.amount ? `${lp.amount.value} ${lp.amount.currency_code}` : '—'),
-      infoRow('Realized savings', money(pp.data.realized_savings_cents))));
-    for (const d of pp.data.deals) {
-      ppKids.push(h('div', { class: 'item' },
-        h('div', { class: 'item-head' }, mono(d.provider),
-          h('div', { class: 'grow' }, h('span', { class: 't-headline' }, `${d.current_plan} to ${d.target_plan}`), h('span', { class: 't-sub dim' }, d.provider)),
-          h('div', { class: 'trail t-headline num green' }, `${moneyShort(d.estimated_annual_savings_cents)}/yr`)),
-        priceTiles(d),
-        h('p', { class: 't-foot dim' }, d.caveat),
-        h('button', { type: 'button', class: 'btn sm press', onclick: () => openRevise(d) }, 'Review and Approve')));
-    }
-    if (!pp.data.deals.length) ppKids.push(foot('No eligible sandbox deal right now.'));
-    ppKids.push(foot(pp.data.note), h('button', { type: 'button', class: 'btn sm gray press', onclick: loadPaypal }, 'Refresh'));
-  }
-  kids.push(section('Manual plan switch', ppKids));
   kids.push(section('Start a sandbox subscription',
     h('div', { class: 'btn-row' },
       h('button', { type: 'button', class: 'btn sm gray press', onclick: () => startSandboxSub('standard') }, 'Standard'),
@@ -1082,7 +1023,7 @@ function go(tab, instant) {
   if (!instant) { viewSpring.set(0); viewSpring.to(1, SPRING.view); }
   window.scrollTo(0, 0);
   if (location.hash.slice(1) !== tab) history.replaceState(null, '', '#' + tab);
-  if (tab === 'labs') { if (!S.pp) loadPaypal(); if (!S.scout) loadScout(); }
+  if (tab === 'labs' && !S.scout) loadScout();
 }
 for (const btn of document.querySelectorAll('.tab')) {
   btn.querySelector('.tab-icon').replaceWith(icon(btn.querySelector('.tab-icon').dataset.icon));
