@@ -92,8 +92,8 @@ Open http://localhost:8000. API docs are at http://localhost:8000/docs.
 
 ## Try the full flow (about 2 minutes)
 
-1. **Plans** → **Add a Plan Billed via PayPal**. The PayPal subscription appears as *ReDealer Demo Membership · Standard · $25.00*.
-2. Optionally add an ordinary subscription too (for example *Spotify · Individual · $11.99*) so the agent also researches the web.
+1. **Plans** → **Load Sample Data**. This loads *Spotify Premium Individual*, *Netflix Standard* and *YouTube Premium* at their US list prices, plus the PayPal sandbox subscription (*ReDealer Demo Membership · Standard · $25.00*). To start over at any time: **Labs** → **Reset to Sample Data**.
+2. If an earlier demo left the PayPal plan on Saver, ReDeal asks PayPal to move it back to Standard: **Continue to PayPal** and confirm as the sandbox buyer.
 3. **Pile** → **Scan for Deals with AI** → **Start Scan**. The agent reads your PayPal subscription and the merchant's catalog, and OpenAI reviews the cheaper Saver plan. Web deals for other subscriptions arrive after a minute or two.
 4. The Saver card carries a **Switches via PayPal** badge and shows $120 per year in projected savings. Swipe it right, or press ✓.
 5. ReDeal asks PayPal to revise the subscription. **Continue to PayPal**, sign in as the sandbox buyer, and confirm. PayPal sends you back to ReDeal, which re-reads the plan from PayPal: **Plans** now shows *Saver · $15.00*.

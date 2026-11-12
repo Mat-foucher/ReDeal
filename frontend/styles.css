@@ -262,6 +262,7 @@ button.row:active { background: var(--fill); }
 .btn.sm { min-height: 44px; padding: 0 16px; font-size: .882rem; border-radius: 22px; }
 .btn-row { display: flex; gap: 8px; flex-wrap: wrap; }
 .btn-row > .btn { flex: 1; }
+.btn-col { display: flex; flex-direction: column; gap: 10px; width: 100%; max-width: 420px; }
 
 .empty { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 12px; text-align: center; padding: 48px 24px; }
 .empty .glyph { width: 72px; height: 72px; border-radius: 36px; background: var(--fill); color: var(--label2); display: flex; align-items: center; justify-content: center; }

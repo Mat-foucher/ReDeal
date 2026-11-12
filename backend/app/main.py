@@ -198,6 +198,9 @@ app.include_router(scout_router)
 from .agent_scout import router as agent_router
 app.include_router(agent_router)
 
+from .sample import router as sample_router
+app.include_router(sample_router)
+
 # Serve the static frontend from the same origin (mounted last so API routes win).
 from fastapi.staticfiles import StaticFiles
 _frontend = Path(__file__).resolve().parents[2] / 'frontend'

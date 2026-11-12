@@ -135,3 +135,47 @@ def test_paypal_plan_found_switched_and_undone(monkeypatch):
     back = client.post(f'/subscriptions/{sid}/undo-switch').json()
     assert state['revisions'] == ['P-SAV', 'P-STD'] and back['paypal_approval_url'] and back['monthly_cost_cents'] == 2500
     client.delete(f'/subscriptions/{sid}')
+
+
+def test_sample_data_replaces_everything_and_resets_paypal(monkeypatch):
+    """Load Sample Data: wipes old data, loads three plans plus the PayPal one, and asks PayPal to move back to Standard."""
+    from app import paypal
+    plan = lambda pid, name, price: {'id': pid, 'name': name, 'product_id': 'PROD-1', 'status': 'ACTIVE',
+        'billing_cycles': [{'tenure_type': 'REGULAR', 'frequency': {'interval_unit': 'MONTH', 'interval_count': 1},
+                            'pricing_scheme': {'fixed_price': {'value': price, 'currency_code': 'USD'}}}]}
+    plans = {'P-STD': plan('P-STD', 'Standard', '25'), 'P-SAV': plan('P-SAV', 'Saver', '15')}
+    state = {'plan': 'P-SAV', 'revisions': []}
+
+    def fake_paypal(method, path, body=None):
+        if path == '/v1/billing/subscriptions/I-SAMPLE1':
+            return {'id': 'I-SAMPLE1', 'status': 'ACTIVE', 'plan_id': state['plan']}
+        if path.startswith('/v1/billing/plans/'):
+            return plans[path.rsplit('/', 1)[1]]
+        if path == '/v1/catalogs/products/PROD-1':
+            return {'name': 'Demo Membership'}
+        if path == '/v1/billing/subscriptions/I-SAMPLE1/revise':
+            state['revisions'].append(body['plan_id'])
+            return {'links': [{'rel': 'approve', 'href': 'https://www.sandbox.paypal.com/approve'}]}
+        raise AssertionError(path)
+
+    monkeypatch.setattr(paypal, 'paypal_request', fake_paypal)
+    for k, v in {'PAYPAL_ENVIRONMENT': 'sandbox', 'PAYPAL_CLIENT_ID': 'x', 'PAYPAL_CLIENT_SECRET': 'y',
+                 'PAYPAL_DEMO_SUBSCRIPTION_ID': 'I-SAMPLE1', 'PAYPAL_STANDARD_PLAN_ID': 'P-STD'}.items():
+        monkeypatch.setenv(k, v)
+
+    client.post('/subscriptions', json={'provider': 'Leftover', 'category': 'other', 'plan_name': 'Old', 'monthly_cost_cents': 100})
+    r = client.post('/sample/load').json()
+    assert r['subscriptions'] == 4 and r['paypal'] == 'reset_requested' and r['approval_url']
+    assert state['revisions'] == ['P-STD']
+    names = sorted(s['provider'] for s in client.get('/subscriptions').json())
+    assert names == ['Demo Membership', 'Netflix', 'Spotify', 'YouTube Premium']
+
+    state['plan'] = 'P-STD'  # already on Standard: no PayPal step needed
+    r = client.post('/sample/load').json()
+    assert r['paypal'] == 'linked' and r['approval_url'] is None and state['revisions'] == ['P-STD']
+    assert len(client.get('/subscriptions').json()) == 4
+
+    for k in ('PAYPAL_CLIENT_ID', 'PAYPAL_DEMO_SUBSCRIPTION_ID'):
+        monkeypatch.delenv(k)
+    r = client.post('/sample/load').json()
+    assert r['subscriptions'] == 3 and r['paypal'] == 'not_configured'

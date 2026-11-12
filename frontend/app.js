@@ -386,6 +386,25 @@ async function linkPaypal() {
     go('subs');
   } catch (e) { toast(e.message, 'err'); }
 }
+// Replace everything with the sample set (three everyday plans plus the PayPal sandbox plan). Asks first if there's data to lose.
+async function loadSample() {
+  if (S.subs.length || S.history.length) {
+    const ok = await confirmSheet({
+      title: 'Reset to Sample Data',
+      message: 'This deletes every subscription, deal and offer here and loads the sample set: Spotify, Netflix, YouTube Premium and the PayPal sandbox plan. Nothing changes with any real provider.',
+      confirm: 'Reset', danger: true,
+    });
+    if (!ok) return;
+  }
+  try {
+    const r = await api('/sample/load', { method: 'POST' });
+    await loadAll();
+    go('subs');
+    if (r.approval_url) paypalConfirmSheet(r.approval_url, 'An earlier demo switched the PayPal plan to Saver. Confirm on PayPal to move it back to Standard, so the scan has a deal to find.');
+    else toast(r.message, r.paypal === 'error' ? 'err' : 'ok');
+  } catch (e) { toast(e.message, 'err'); }
+}
+
 // PayPal sends the buyer back with ?paypal=approved or ?paypal=cancelled; re-read what PayPal now bills.
 async function handlePaypalReturn() {
   const p = new URLSearchParams(location.search).get('paypal');
@@ -418,9 +437,11 @@ function renderSubs() {
   if (S.offline) kids.push(offlineState());
   else if (S.loaded && !S.subs.length) {
     kids.push(emptyState('card', 'No subscriptions yet', 'Add what you pay each month, or bring in a plan billed through PayPal, and ReDeal’s AI agent will find cheaper plans.',
-      h('div', { class: 'btn-row' },
-        h('button', { type: 'button', class: 'btn press', onclick: openAddSub }, 'Add Subscription'),
-        h('button', { type: 'button', class: 'btn gray press', onclick: linkPaypal }, icon('link', 20), 'Add from PayPal'))));
+      h('div', { class: 'btn-col' },
+        h('button', { type: 'button', class: 'btn press', onclick: loadSample }, icon('sparkle', 20), 'Load Sample Data'),
+        h('div', { class: 'btn-row' },
+          h('button', { type: 'button', class: 'btn gray press', onclick: openAddSub }, 'Add Subscription'),
+          h('button', { type: 'button', class: 'btn gray press', onclick: linkPaypal }, icon('link', 20), 'Add from PayPal')))));
   } else if (S.subs.length) {
     const monthly = S.subs.reduce((n, s) => n + s.monthly_cost_cents, 0);
     const saved = S.subs.reduce((n, s) => n + switchSaving(s), 0);
@@ -975,6 +996,9 @@ function openRevise(deal) {
 function renderLabs() {
   const v = $('#view-labs');
   const pp = S.pp, kids = [head('PayPal sandbox tools', 'Labs')];
+  kids.push(section('Demo data',
+    h('button', { type: 'button', class: 'btn sm gray danger press', onclick: loadSample }, 'Reset to Sample Data'),
+    foot('Starts over with Spotify, Netflix, YouTube Premium and the PayPal sandbox plan. If an earlier visitor switched the PayPal plan, you’ll be asked to confirm moving it back on PayPal.')));
   kids.push(section('Your PayPal plan',
     h('button', { type: 'button', class: 'btn sm press', onclick: linkPaypal }, icon('link', 18), 'Add Sandbox Subscription to Plans'),
     foot('Brings the subscription in PAYPAL_DEMO_SUBSCRIPTION_ID into Plans, priced from PayPal. Then scan in the Swipe Pile: the agent finds cheaper plans in the merchant’s PayPal catalog, and approving one switches it through PayPal.')));
