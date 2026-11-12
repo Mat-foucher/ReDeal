@@ -233,6 +233,9 @@ a { color: var(--tint); text-decoration: none; }
 button.row:active { background: var(--fill); }
 .row.wrap { flex-wrap: wrap; }
 .row.wrap .trail { max-width: 100%; }
+/* Info rows: never squeeze the label; a long value wraps beside it instead. */
+.row.wrap > .grow { min-width: max-content; }
+.row.wrap > .trail { flex: 0 1 auto; }
 
 .mono {
   flex: none; width: 40px; height: 40px; border-radius: var(--r-mono);
@@ -344,6 +347,8 @@ button.row:active { background: var(--fill); }
 .nav-btn.strong { font-weight: 600; justify-self: end; text-align: right; }
 .sheet-body { overflow-y: auto; overscroll-behavior: contain; -webkit-overflow-scrolling: touch; padding: 8px 20px calc(env(safe-area-inset-bottom, 0px) + 24px); display: flex; flex-direction: column; gap: 20px; }
 .sheet-body form { display: flex; flex-direction: column; gap: 20px; }
+/* Tall sheets scroll; their sections must never be squashed to fit. */
+.sheet-body > *, .sheet-body form > * { flex-shrink: 0; }
 .sheet-msg { text-align: center; padding: 0 8px; }
 
 .field label { flex: none; min-width: 6.2em; }
